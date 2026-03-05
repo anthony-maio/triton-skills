@@ -61,5 +61,8 @@ Read these files for detailed guidance when the task involves these areas:
 | FP4/FP8 quantized matmul, block scaling | `triton-quantized-block-scaled-gemm.md` |
 | Kernel fusion, Philox dropout, recomputation | `triton-memory-efficient-patterns.md` |
 | General tiled GEMM, autotune, benchmarking | `triton-gpu-kernel-optimization.md` |
+| Fusing normalization/gating/residual into attention or matmul epilogue | `triton-fused-epilogue-kernels.md` |
+| Sequential stateful processing (LRU routing, mutable register state) | `triton-sequential-stateful-blocks.md` |
+| Launcher tile selection, num_stages/num_warps heuristics | `triton-dynamic-launcher-tiling.md` |
 
 **When to read specialized files:** Only read the relevant file when the user's task specifically involves that topic. The core patterns above are sufficient for basic kernels (vector ops, elementwise fusion, simple reductions).

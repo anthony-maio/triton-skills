@@ -19,6 +19,9 @@ Always-loaded fundamentals — `@triton.jit`, block tiling, masking, autotune, g
 | `triton-quantized-block-scaled-gemm.md` | FP4/FP8 block-scaled GEMM, OCP microscaling, `tl.dot_scaled` | 20% |
 | `triton-memory-efficient-patterns.md` | Philox seed-based dropout, kernel fusion, activation recomputation | 20% |
 | `triton-gpu-kernel-optimization.md` | Tiled GEMM, L2 cache-aware tile ordering, autotune sweeps | 20% |
+| `triton-fused-epilogue-kernels.md` | Fuse normalization, gating, residual into attention/matmul epilogues | 40% |
+| `triton-sequential-stateful-blocks.md` | Sequential stateful kernels — LRU routing, mutable register state | 40% |
+| `triton-dynamic-launcher-tiling.md` | Launcher tile heuristics, num_stages/num_warps, dtype-aware sizing | 60% |
 
 **Eval lift** = improvement in task success rate with the skill vs. without, evaluated on Haiku.
 
@@ -37,12 +40,12 @@ Then reference the skill in your Claude Code configuration.
 
 Each skill was generated using [Hugging Face Upskill](https://github.com/huggingface/upskill):
 
-1. A detailed Triton task description (derived from the [official tutorials](https://triton-lang.org/main/getting-started/tutorials/index.html)) is sent to **Opus** as the teacher model
+1. A detailed Triton task description (derived from the [official tutorials](https://triton-lang.org/main/getting-started/tutorials/index.html) and real-world kernel patterns) is sent to **Opus** as the teacher model
 2. Synthetic test cases are generated for the task
 3. **Haiku** evaluates task completion with and without the skill
 4. If the skill doesn't improve results, it's refined based on failure descriptions (up to 3 rounds)
 
-All 6 skills passed evaluation on the first or second attempt.
+All 9 skills passed evaluation on the first or second attempt.
 
 ## License
 
