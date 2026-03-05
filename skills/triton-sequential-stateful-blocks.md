@@ -1,59 +1,154 @@
 ---
 name: triton-sequential-stateful-blocks
-description: Teach writing Triton kernels that perform sequential, stateful processing inside one block.
+description: Write Triton kernels with sequential stateful processing inside a single thread block, with mutable register state visible across iterations.
 ---
 
 # Sequential Stateful Processing in a Single Triton Block
 
 > **Targets:** Triton >= 2.1, SM70+/CDNA2+
 
-Overview
-Some workloads require one thread block to process a sequence of items with mutable register state (e.g., an LRU cache router). This pattern uses a grid like (B,) — one block per batch element — and updates registers in a sequential loop so each iteration sees the exact mutated state from previous iterations.
+## Overview
 
-Key principles / step-by-step
-- Use one block per sequence (grid=(B,)). Keep mutable state in registers / SRAM and never write intermediate state back to HBM until the end.
-- Initialize state (used flags, timestamps, cached vectors) into register-backed tl.load values before the candidate loop.
-- Iterate sequentially: for t in range(T): compute reductions, make scalar decisions, mutate registers immediately (e.g., update timestamp array in registers).
-- Use scalar control flow (if/elif/else) on reduced scalars. Create scalar constants with tl.full([],...). Use tl.zeros([],...)/tl.full([],..., dtype=tl.int1) for booleans.
-- For mixed outputs, use separate output pointers/strides for indices (int64), flags (int32/int1), and float scores.
-- For multi-head comparisons, perform head-loop reductions inside the candidate loop, aggregate to a scalar decision, mask inactive slots, then argmax/argmin for routing.
+Some workloads require one thread block to process a sequence of items with mutable register state (e.g., LRU cache routing, sequential assignment). This pattern uses grid `(B,)` — one block per batch element — and updates registers in a sequential loop so each iteration sees the exact mutated state from previous iterations.
 
-Examples
+**When to use:** When output of iteration `t` depends on state mutations from iteration `t-1` and parallel processing would give wrong results (e.g., two candidates claiming the same victim slot).
 
-1) LRU routing sketch (core loop)
+## Architecture: grid=(B,), sequential candidate loop
+
 ```python
-# per-block registers: used_r (int32[ME]), ts_r (int64[ME]), cache_r (ME, DH)
+@triton.jit
+def _sequential_kernel(
+    # ... input/output pointers, strides ...
+    H_KV: tl.constexpr,    # number of KV heads
+    T: tl.constexpr,       # number of candidates (typically 8-16)
+    ME: tl.constexpr,      # number of slots (typically 64)
+    DH: tl.constexpr,      # head dimension
+    AE: tl.constexpr,      # active capacity (<= ME)
+):
+    off_b = tl.program_id(0)
+    offs_me = tl.arange(0, ME)
+    offs_dh = tl.arange(0, DH)
+
+    # Active slot mask: only slots [0, AE) participate
+    active_mask = offs_me < AE
+```
+
+## Phase 1: Load shared state into SRAM
+
+Load all mutable state into registers BEFORE the candidate loop. Never write intermediate state to HBM.
+
+```python
+# Verified pattern from production LRU bank routing kernel
+# used: (ME,) bool — loaded as int8, converted to int1, masked by active slots
+sram_used = tl.load(used_ptrs).to(tl.int1) & active_mask
+
+# last: (ME,) int64 — LRU timestamps
+sram_last = tl.load(last_ptrs)
+
+# Track whether ANY slot is used (scalar, kept as int32 for type stability)
+any_used = tl.max(sram_used.to(tl.int32), axis=0)
+```
+
+## Phase 2: Sequential candidate processing
+
+Each iteration loads one candidate, computes scores, classifies, and mutates register state immediately.
+
+```python
 for t in range(T):
-    cand = tl.load(cand_ptr + t * cand_stride)        # (DH,)
-    avg_scores = tl.zeros((ME,), dtype=tl.float32)
-    for h in range(H_KV):
-        head_cache = cache_r[h]                       # (ME, DH)
-        scores_h = tl.sum(head_cache * cand, axis=1)
-        avg_scores += scores_h
-    avg_scores = avg_scores / H_KV
-    masked = tl.where((used_r != 0) & active_mask, avg_scores, tl.full((ME,), -1e9))
-    best_score = tl.max(masked); best_idx = tl.argmax(masked)
-    is_hit = best_score > threshold
-    if is_hit:
-        ts_r[best_idx] = current_time                   # immediate mutation
-    else:
-        victim = tl.argmin(ts_r)
-        used_r[victim] = tl.full([], 1, dtype=tl.int32)
-        ts_r[victim] = current_time
-    # write per-candidate outputs to separate buffers
-    tl.store(out_idx_ptr + t * s0, tl.cast(best_idx, tl.int64))
-    tl.store(out_flag_ptr + t * s1, tl.cast(is_hit, tl.int32))
+    # Default outputs: not-overwrite, not-touch, idx=0
+    idx_t: tl.int64 = tl.zeros([], dtype=tl.int64)
+    overwrite_t: tl.int1 = tl.zeros([], dtype=tl.int1)
+    touch_t: tl.int1 = tl.zeros([], dtype=tl.int1)
+
+    gate = tl.load(gate_ptr + off_b * stride_gb + t * stride_gt)
+    keep = gate >= TAU_GATE
+
+    if keep:
+        # ------ Multi-head similarity scoring ------
+        avg_scores = tl.zeros([ME], dtype=tl.float32)
+        for h in range(H_KV):
+            # Load candidate vector for this head: (DH,)
+            v_tok = tl.load(v_ptrs + h * stride_vh + t * stride_vt + offs_dh * stride_vd).to(tl.float32)
+            # Load cached bank vectors: (ME, DH)
+            mem_tile = tl.load(mem_ptrs + h * stride_mh + offs_me[:, None] * stride_mm + offs_dh[None, :] * stride_md).to(tl.float32)
+            # Dot product: (ME, DH) * (DH,) → (ME,)
+            scores_h = tl.sum(mem_tile * v_tok[None, :], axis=1)
+            avg_scores += scores_h
+        avg_scores = avg_scores / H_KV
+
+        # Mask unused and inactive slots
+        avg_scores = tl.where(sram_used & active_mask, avg_scores, -1e9)
+        best_score = tl.max(avg_scores, axis=0)
+        best_idx = tl.argmax(avg_scores, axis=0).to(tl.int64)
+
+        # ------ Classify: novel, hit, or skip ------
+        is_novel = (any_used == 0) | (best_score < TAU_NOVEL)
+        is_hit = (any_used != 0) & (best_score >= TAU_MATCH)
+
+        if is_novel:
+            # LRU victim: unused slots get -inf timestamp (picked first),
+            # inactive slots get +inf (never picked)
+            lru_key = tl.where(
+                active_mask,
+                tl.where(sram_used, sram_last, tl.full([ME], value=-2**62, dtype=tl.int64)),
+                tl.full([ME], value=2**62, dtype=tl.int64),
+            )
+            victim = tl.argmin(lru_key, axis=0).to(tl.int64)
+            idx_t = victim
+            overwrite_t = tl.full([], value=1, dtype=tl.int1)
+            touch_t = tl.full([], value=1, dtype=tl.int1)
+
+            # IMMEDIATE state mutation — visible to next iteration
+            pos_t = tl.load(pos_ptr + off_b * stride_pb + t * stride_pt)
+            sram_used = sram_used | (offs_me == victim)
+            sram_last = tl.where(offs_me == victim, pos_t, sram_last)
+            any_used = 1
+
+        elif is_hit:
+            idx_t = best_idx
+            overwrite_t = tl.full([], value=1, dtype=tl.int1)
+            touch_t = tl.full([], value=1, dtype=tl.int1)
+            pos_t = tl.load(pos_ptr + off_b * stride_pb + t * stride_pt)
+            sram_last = tl.where(offs_me == best_idx, pos_t, sram_last)
+
+        else:
+            idx_t = best_idx  # skip — no state mutation
+
+    # Store per-candidate outputs (separate pointers per output type)
+    tl.store(idx_ptr + off_b * stride_ib + t * stride_it, idx_t)
+    tl.store(overwrite_ptr + off_b * stride_ob + t * stride_ot, overwrite_t)
+    tl.store(touch_ptr + off_b * stride_tb + t * stride_tt, touch_t)
 ```
 
-2) Scalar control and constants
+## Phase 3: Write final state to HBM
+
 ```python
-flag_false = tl.zeros([], dtype=tl.int1)
-one_i32 = tl.full([], 1, dtype=tl.int32)
+# Only write SRAM state back at the very end
+tl.store(last_out_ptrs, sram_last)
 ```
 
-Best practices / pitfalls
-- Keep state in registers: spilling to HBM breaks sequential semantics and kills performance.  
-- Use int32 for mutable boolean-like registers to avoid type inconsistencies across branches.  
-- Avoid large register pressure: big caches or many heads may reduce occupancy; split if necessary.  
-- Cast indices to tl.int64 before pointer arithmetic.  
-- Ensure dtype consistency across branches to avoid compilation surprises.
+## Launcher pattern
+
+```python
+def launch(v_sel_norm, mem_v_norm, used, last, gate_sel, pos_sel, **kwargs):
+    B, Hkv, T, Dh = v_sel_norm.shape
+    Me = mem_v_norm.shape[2]
+    # Ensure contiguous, allocate outputs
+    idx_tok = torch.zeros((B, T), device=device, dtype=torch.int64)
+    overwrite_tok = torch.zeros((B, T), device=device, dtype=torch.bool)
+    touch_tok = torch.zeros((B, T), device=device, dtype=torch.bool)
+    last_out = last.clone()  # clone so original is preserved
+
+    grid = (B,)
+    kernel[grid](..., H_KV=Hkv, T=T, ME=Me, DH=Dh, AE=active_capacity)
+```
+
+## Key constraints
+
+- **Sequential semantics:** The loop body MUST see updated register state — no parallelism across `t` iterations.
+- **Type consistency:** Use `int32` for mutable boolean-like registers; Triton requires consistent dtypes across all `if/elif/else` branches.
+- **Scalar constants:** `tl.zeros([], dtype=tl.int1)` for False, `tl.full([], value=1, dtype=tl.int1)` for True.
+- **Index casting:** `tl.argmax`/`tl.argmin` return indices; always `.to(tl.int64)` before pointer arithmetic.
+- **Register state updates via `tl.where`:** You cannot index-assign into Triton tensors (`ts_r[idx] = val`). Instead: `sram_last = tl.where(offs_me == victim, new_val, sram_last)`.
+- **Active vs used masking:** Separate `active_mask` (capacity limit) from `sram_used` (occupancy). Inactive slots should never be picked as LRU victims.
+- **Fallback:** Always provide a PyTorch reference implementation for CPU/non-Triton environments with identical sequential semantics.

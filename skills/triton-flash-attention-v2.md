@@ -1,62 +1,130 @@
 ---
 name: triton-flash-attention-v2
-description: Teach an AI agent how to implement FlashAttention v2 kernels in Triton for memory-efficient transformer attention.
+description: Implement FlashAttention v2 kernels in Triton with online softmax, causal masking, GQA head routing, multi-stream accumulators, and fused epilogues.
 ---
 
 # FlashAttention v2 kernels in Triton
 
 > **Targets:** Triton >= 2.1, SM70+/CDNA2+
 
-Overview
-This guide explains how to implement memory-efficient fused attention (FlashAttention v2) in Triton. The kernel computes O = softmax(QK^T / sqrt(d_k)) V without materializing the N×N attention matrix by iterating over K/V blocks, maintaining running softmax statistics (m, l), and recomputing weights in the backward pass.
+## Overview
 
-Key principles / step-by-step
-1. Grid: launch a Triton kernel grid over (batch, heads, query_block_idx). Each kernel handles a BLOCK_M×d_k slice of Q and iterates over K/V blocks of width BLOCK_N.
-2. Data types: accept FP16 inputs; use FP32 accumulators for dot products and softmax math for stability.
-3. Inner loop (per K/V block):
-   - Load Q_block (BLOCK_M×d_k), K_block (BLOCK_N×d_k), V_block (BLOCK_N×d_v).
-   - Compute S = tl.dot(Q_block, tl.trans(K_block)) * sm_scale (use fp32 accumulators). Note: use `tl.trans()`, not the deprecated `trans_b` kwarg.
-   - If causal and this K_block lies after current Q positions, mask upper triangle in S for partial blocks.
-   - Apply per-row max: m_block = tl.max(S, axis=1); compute exp(S - m_block).
-   - Update running m_prev, l_prev (where l is sum of exp); when m_new > m_prev, rescale accumulator: acc *= tl.exp(m_prev - m_new).
-   - Update acc = acc + exp(S - m_new) @ V_block (use tl.dot for attn@V).
-   - Update l_last and store m and logsumexp per query-block for backward: logsumexp = m + log(l).
-4. After all blocks, write O_block (cast back to FP16) and store logsumexp per query row.
+FlashAttention v2 computes `O = softmax(QK^T / sqrt(d_k)) V` without materializing the N×N attention matrix. The kernel iterates over K/V blocks, maintains running softmax statistics `(m, l, acc)` in registers, and recomputes attention weights in the backward pass.
 
-Backward (recompute-attention):
-- Recompute S blocks using saved Q/K blocks and logsumexp to reconstruct normalized weights per-block:
-  - attn_block = tl.exp(S - (logsumexp_row))  (use fp32)
-  - dV contribution: dO accumulates via tl.dot(attn_block.T, dO_block) etc.
-- This avoids storing full attention matrix.
+## Grid and program mapping
 
-Code examples (pseudocode — adapt offsets/strides for your layout)
+Use a 2D grid: `(cdiv(Q_LEN, BLOCK_M), B * H)` — one program per (query_block, batch×head) pair.
+
 ```python
-@triton.jit
-def flash_fwd(Q_ptr, K_ptr, V_ptr, O_ptr, logsumexp_ptr, ...,
-              BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
-    # ... load q tile (BLOCK_M, d_k), set up offsets ...
-    acc = tl.zeros((BLOCK_M, d_v), dtype=tl.float32)
-    m = tl.full((BLOCK_M,), -1e9, dtype=tl.float32)
-    l = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    for k_start in range(0, N, BLOCK_N):
-        k = tl.load(...)   # (BLOCK_N, d_k)
-        v = tl.load(...)   # (BLOCK_N, d_v)
-        s = tl.dot(q, tl.trans(k)) * sm_scale  # (BLOCK_M, BLOCK_N)
-        # apply triangular mask when causal
-        m_new = tl.maximum(m, tl.max(s, axis=1))      # unconditional update
-        alpha = tl.exp(m - m_new)                      # rescale factor
-        p = tl.exp(s - m_new[:, None])
-        l = l * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
-        m = m_new
-    tl.store(O_ptr + ..., (acc / l[:, None]).to(OUT_DTYPE))
-    tl.store(logsumexp_ptr + ..., m + tl.log(l))
+pid_m = tl.program_id(0)     # query block index
+pid_bh = tl.program_id(1)    # batch * head index
+off_b = pid_bh // H
+off_h = pid_bh % H
 ```
 
-Best practices & pitfalls
-- Use FP32 accumulators and compute logsumexp to avoid instability.
-- Autotune BLOCK_M/BLOCK_N; choose BLOCK_N that fits L2 for K/V.
-- Implement block-level triangular masking for causal attention carefully for partial blocks.
-- Rescale accumulators when m changes: acc *= exp(m_prev - m_new).
-- Backward must recompute per-block S with identical tiling and masks; ensure determinism.
-- Avoid excessive register pressure—favor moderate BLOCK sizes.
+For GQA (grouped-query attention), map Q heads to K/V heads in-kernel:
+```python
+groups: tl.constexpr = H // H_KV
+off_h_kv = off_h // groups   # which KV head serves this Q head
+```
+
+## Online softmax — the core loop
+
+Initialize FP32 accumulators before the KV loop:
+```python
+m = tl.full([BLOCK_M], value=float("-inf"), dtype=tl.float32)
+l = tl.zeros([BLOCK_M], dtype=tl.float32)
+acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+```
+
+The KV loop uses unconditional `tl.maximum` — never branch on tensor values:
+```python
+# Verified pattern (from production differential-attention kernel)
+for block_n in range(0, n_blocks):
+    offs_kv = block_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_kv < KV_LEN
+
+    k_tile = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
+    v_tile = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+
+    qk = tl.dot(q_tile, tl.trans(k_tile)) * sm_scale
+
+    # Causal + OOB mask
+    if IS_CAUSAL:
+        causal_mask = (offs_m[:, None] + prefix_len) >= offs_kv[None, :]
+        qk = tl.where(causal_mask & mask_n[None, :], qk, float("-inf"))
+    else:
+        qk = tl.where(mask_n[None, :], qk, float("-inf"))
+
+    # Online softmax update (unconditional — no tensor `if`)
+    m_new = tl.maximum(m, tl.max(qk, axis=1))
+    alpha = tl.exp(m - m_new)
+    p = tl.exp(qk - m_new[:, None])
+    l = l * alpha + tl.sum(p, axis=1)
+    acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
+    m = m_new
+```
+
+Finalize and store:
+```python
+acc = acc / (l[:, None] + 1e-10)            # guard against div-by-zero
+tl.store(out_ptrs, acc.to(OUT.dtype.element_ty), mask=mask_m[:, None])
+```
+
+## Causal masking — lower-right triangle
+
+For causal attention where KV_LEN >= Q_LEN (e.g., prefill with KV cache):
+```python
+prefix_len = KV_LEN - Q_LEN
+# Query at position q_idx attends to k_idx where: q_idx + prefix_len >= k_idx
+causal_mask = (offs_m[:, None] + prefix_len) >= offs_kv[None, :]
+```
+
+## Multi-stream accumulators (differential / mixture attention)
+
+For N parallel attention streams sharing K/V tile loads, maintain separate `(m, l, acc)` per stream:
+```python
+# Two streams: signal and noise (differential attention)
+m_s = tl.full([BLOCK_M], value=float("-inf"), dtype=tl.float32)
+l_s = tl.zeros([BLOCK_M], dtype=tl.float32)
+acc_s = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+m_n = tl.full([BLOCK_M], value=float("-inf"), dtype=tl.float32)
+l_n = tl.zeros([BLOCK_M], dtype=tl.float32)
+acc_n = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+for block_n in range(n_blocks):
+    k_tile = tl.load(...)   # loaded ONCE
+    v_tile = tl.load(...)   # loaded ONCE
+
+    qk_s = tl.dot(q_signal, tl.trans(k_tile)) * sm_scale
+    qk_n = tl.dot(q_noise,  tl.trans(k_tile)) * sm_scale
+    # ... apply masks to both, update both accumulators independently ...
+
+# Combine in-register after loop (no extra HBM round-trip)
+acc_s = acc_s / (l_s[:, None] + 1e-10)
+acc_n = acc_n / (l_n[:, None] + 1e-10)
+diff = acc_s - lam[:, None] * acc_n
+```
+
+## Verification harness pattern
+
+Always test against a PyTorch SDPA reference:
+```python
+def reference(q, q_noise, k, v, lam, is_causal=False):
+    # GQA expansion: k[:, :, None, :, :].expand(...).reshape(B, H, Lk, Dh)
+    out_sig = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=is_causal)
+    out_noise = F.scaled_dot_product_attention(q_noise, k_exp, v_exp, is_causal=is_causal)
+    return out_sig - lam * out_noise
+
+# Tolerances: bf16 → max 6e-2, mean 1e-2; fp16 → max 2e-2, mean 5e-3
+```
+
+## Best practices
+
+- Apply `sm_scale` after `tl.dot`, not by pre-scaling Q — avoids promoting Q from bf16 to fp32 which causes dtype mismatch in `tl.dot`.
+- Use `tl.trans(k)`, not the deprecated `trans_b` kwarg.
+- Cast `p.to(v_tile.dtype)` before `tl.dot(p, v)` — Triton requires matching dtypes.
+- Add `+ 1e-10` to the denominator when dividing by `l` to guard against all-masked rows.
+- For causal decode (Lq=1), use small BLOCK_M (16) to avoid wasted compute.
+- Backward pass: recompute S blocks using saved Q/K and `logsumexp = m + tl.log(l)` per query row.

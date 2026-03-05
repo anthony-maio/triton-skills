@@ -1,100 +1,143 @@
 ---
 name: triton-fused-normalizations
-description: Teach an AI agent to implement fused LayerNorm, RMSNorm, and GroupNorm kernels (forward & backward) in Triton.
+description: Implement fused LayerNorm, RMSNorm, and GroupNorm kernels (forward & backward) in Triton with single-pass statistics and two-stage reductions.
 ---
 
 # Fused Normalization Kernels in Triton (LayerNorm, RMSNorm, GroupNorm)
 
 > **Targets:** Triton >= 2.1, SM70+/CDNA2+
 
-Overview
-This guide teaches how to implement fused forward and backward normalization kernels in Triton: LayerNorm, RMSNorm, and GroupNorm. The focus is single-pass mean/variance accumulation, saving mean and rstd (1/std) for backward, two-stage reductions for weight gradients, and safe concurrent accumulation. Use fp32 accumulators even when inputs are fp16, and map one program per normalization "row" (e.g., per token or per group).
+## Overview
 
-Key principles / step-by-step
-1. Grid & tiling:
-   - Launch one program per row (example: batch*seq*groups). Let BLOCK_F be feature chunk size. If F > BLOCK_F, loop across feature chunks and accumulate partial sums.
-   - cdiv(F, BLOCK_F) chunks: compute running sum and sumsq in a single pass per row.
-2. Single-pass mean/variance:
-   - For each chunk: s += sum(x), ss += sum(x*x). After all chunks: mean = s / F; var = ss / F - mean^2; rstd = 1 / sqrt(var + eps).
-   - Save mean and rstd to scratch buffers for backward.
-3. Forward formulas:
-   - LayerNorm: x_hat = (x - mean) * rstd; y = x_hat * gamma + beta
-   - RMSNorm: x_hat = x * rstd_rms where rstd_rms = 1/sqrt(mean(x^2)+eps); y = x_hat * gamma
-   - GroupNorm: treat each group as a row; apply LayerNorm per group
-4. Backward (VJP) per-row:
-   - Given dy and saved x_hat, mean(dy) and mean(dy * x_hat) computed over features:
-     dx = (1/std) * (dy - mean(dy) - x_hat * mean(dy * x_hat)) * gamma
-     dgamma = sum(dy * x_hat)
-     dbeta = sum(dy)
-   - Compute per-block partial sums for dgamma/dbeta; write partials in an intermediate buffer.
-5. Two-stage reduction:
-   - Kernel A: per-row kernels compute forward and backward partials; each block writes partial dgamma/dbeta per (head, channel) to a workspace.
-   - Kernel B: small reduction kernel (or warp-level tree) sums partials across blocks and writes final dgamma/dbeta.
-   - Alternatively, atomically accumulate into global dgamma/dbeta using tl.atomic_add (watch contention and performance).
-6. Synchronization & precision:
-   - Use tl.float32 for s, ss, accumulators and intermediate sums.
-   - Save mean and rstd for reuse in backward to avoid recomputation.
+Fused normalization kernels compute statistics and apply normalization in a single pass, avoiding extra HBM round-trips. Map one program per normalization "row" (per token for LayerNorm/RMSNorm, per group for GroupNorm). Always use FP32 accumulators.
 
-Practical code examples
-LayerNorm forward (simplified):
+## Forward formulas
+
+- **LayerNorm:** `x_hat = (x - mean) * rstd; y = x_hat * gamma + beta`
+  - `mean = sum(x) / F; var = sum(x*x)/F - mean*mean; rstd = 1/sqrt(var + eps)`
+- **RMSNorm:** `y = x * rstd * gamma` where `rstd = 1/sqrt(mean(x^2) + eps)`
+  - No mean subtraction — simpler and 2-3x faster than PyTorch for bandwidth-bound shapes
+- **GroupNorm:** treat each group as a LayerNorm row
+
+## RMSNorm — standalone kernel
+
+```python
+@triton.jit
+def rmsnorm_fwd(x_ptr, gamma_ptr, y_ptr, F, eps, BLOCK_F: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_F)
+    mask = offs < F
+    x = tl.load(x_ptr + row * F + offs, mask=mask, other=0.0).to(tl.float32)
+    ss = tl.sum(x * x, axis=0)
+    rstd = tl.math.rsqrt(ss / F + eps)
+    gamma = tl.load(gamma_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+    y = x * rstd * gamma
+    tl.store(y_ptr + row * F + offs, y.to(x_ptr.dtype.element_ty), mask=mask)
+```
+
+## RMSNorm — fused into attention epilogue (verified)
+
+From production differential-attention kernel — applies RMSNorm in-register right before the final store, eliminating an extra kernel launch and HBM read/write:
+
+```python
+# After online-softmax finalization:
+diff = acc_s - lam[:, None] * acc_n    # (BLOCK_M, HEAD_DIM), already FP32
+
+if APPLY_RMS:    # tl.constexpr — compiled out when False
+    var = tl.sum(diff * diff, axis=1) / HEAD_DIM           # (BLOCK_M,)
+    rstd = tl.math.rsqrt(var + eps)                         # (BLOCK_M,)
+    diff = diff * rstd[:, None]                              # normalize
+    rms_w = tl.load(RMS_W + offs_d)                         # (HEAD_DIM,) — loaded once
+    diff = diff * rms_w[None, :]                             # apply weight
+
+tl.store(out_ptrs, diff.to(OUT.dtype.element_ty), mask=mask_m[:, None])
+```
+
+**Key:** `tl.math.rsqrt(var + eps)` is the preferred API for reciprocal square root.
+
+## LayerNorm — forward with feature chunking
+
+When `F > BLOCK_F`, loop over chunks to accumulate partial sums:
+
 ```python
 @triton.jit
 def layernorm_fwd(x_ptr, gamma_ptr, beta_ptr, mean_ptr, rstd_ptr, y_ptr,
-                  B, F, BLOCK_F: tl.constexpr):
+                  F, eps, BLOCK_F: tl.constexpr):
     row = tl.program_id(0)
-    offs = row * F + tl.arange(0, BLOCK_F)
-    # load chunk (with bounds)
-    x = tl.load(x_ptr + offs, mask=offs < row*F + F, other=0.).to(tl.float32)
-    s = tl.sum(x, 0)
-    ss = tl.sum(x * x, 0)
-    # across chunks: use loop and accumulate s, ss
-    mean = s_total / F
-    rstd = 1.0 / tl.sqrt(ss_total / F - mean*mean + eps)
+    # Single-pass accumulation
+    s = tl.zeros([], dtype=tl.float32)
+    ss = tl.zeros([], dtype=tl.float32)
+    for chunk_start in range(0, F, BLOCK_F):
+        offs = chunk_start + tl.arange(0, BLOCK_F)
+        mask = offs < F
+        x = tl.load(x_ptr + row * F + offs, mask=mask, other=0.0).to(tl.float32)
+        s += tl.sum(x, axis=0)
+        ss += tl.sum(x * x, axis=0)
+
+    mean = s / F
+    rstd = 1.0 / tl.sqrt(ss / F - mean * mean + eps)
     tl.store(mean_ptr + row, mean)
     tl.store(rstd_ptr + row, rstd)
-    x_hat = (x - mean) * rstd
-    y = x_hat * tl.load(gamma_ptr + offs).to(tl.float32) + tl.load(beta_ptr + offs).to(tl.float32)
-    tl.store(y_ptr + offs, y.to(x.dtype))
+
+    # Second pass: normalize and store
+    for chunk_start in range(0, F, BLOCK_F):
+        offs = chunk_start + tl.arange(0, BLOCK_F)
+        mask = offs < F
+        x = tl.load(x_ptr + row * F + offs, mask=mask, other=0.0).to(tl.float32)
+        x_hat = (x - mean) * rstd
+        g = tl.load(gamma_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+        b = tl.load(beta_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        y = x_hat * g + b
+        tl.store(y_ptr + row * F + offs, y.to(x_ptr.dtype.element_ty), mask=mask)
 ```
 
-Backward partials + dx computation (per row):
+## Backward — two-stage reduction for dgamma/dbeta
+
+**Kernel A (per-row):** compute dx and partial dgamma/dbeta per block:
 ```python
 @triton.jit
-def layernorm_bwd_part(x_ptr, dy_ptr, gamma_ptr, mean_ptr, rstd_ptr, dx_ptr,
-                       dgamma_p_ptr, dbeta_p_ptr, B, F, BLOCK_F: tl.constexpr):
+def layernorm_bwd(x_ptr, dy_ptr, gamma_ptr, mean_ptr, rstd_ptr,
+                  dx_ptr, dgamma_partial_ptr, dbeta_partial_ptr,
+                  F, BLOCK_F: tl.constexpr):
     row = tl.program_id(0)
-    offs = row * F + tl.arange(0, BLOCK_F)
-    x = tl.load(x_ptr + offs).to(tl.float32)
-    dy = tl.load(dy_ptr + offs).to(tl.float32)
+    offs = tl.arange(0, BLOCK_F)
+    mask = offs < F
+    x = tl.load(x_ptr + row * F + offs, mask=mask).to(tl.float32)
+    dy = tl.load(dy_ptr + row * F + offs, mask=mask).to(tl.float32)
     mean = tl.load(mean_ptr + row)
     rstd = tl.load(rstd_ptr + row)
+    gamma = tl.load(gamma_ptr + offs, mask=mask).to(tl.float32)
+
     x_hat = (x - mean) * rstd
-    # partial reductions
-    s_dy = tl.sum(dy, 0)
-    s_dyx = tl.sum(dy * x_hat, 0)
-    # write partials to workspace (one slot per block)
-    tl.store(dgamma_p_ptr + row*P + block_id, tl.sum(dy * x_hat))
-    tl.store(dbeta_p_ptr + row*P + block_id, tl.sum(dy))
-    # compute dx using formula with per-row means later reduced across blocks (or compute exact per-row means here)
-    dx = (rstd) * (dy - s_dy / F - x_hat * (s_dyx / F)) * tl.load(gamma_ptr + offs).to(tl.float32)
-    tl.store(dx_ptr + offs, dx.to(x.dtype))
+    s_dy = tl.sum(dy * gamma, axis=0)
+    s_dyx = tl.sum(dy * gamma * x_hat, axis=0)
+
+    # dx = rstd * (dy*gamma - (s_dy + x_hat*s_dyx)/F)
+    dx = rstd * (dy * gamma - (s_dy + x_hat * s_dyx) / F)
+    tl.store(dx_ptr + row * F + offs, dx.to(x_ptr.dtype.element_ty), mask=mask)
+
+    # Write partial dgamma/dbeta for this row
+    tl.store(dgamma_partial_ptr + row * F + offs, dy * x_hat, mask=mask)
+    tl.store(dbeta_partial_ptr + row * F + offs, dy, mask=mask)
 ```
 
-Final reduction kernel:
+**Kernel B (reduction):** sum partials across rows to get final dgamma/dbeta per feature.
+
+## Weight handling: may be None
+
+Some models use `elementwise_affine=False`. Handle both cases:
 ```python
-@triton.jit
-def reduce_partials(dgamma_p, dbeta_p, dgamma, dbeta, rows, parts):
-    gid = tl.program_id(0)
-    # sum over parts per row and write final dgamma/dbeta
+has_weight = gamma is not None
+if not has_weight:
+    gamma = torch.ones(F, device=x.device, dtype=x.dtype)
 ```
 
-Best practices & common pitfalls
-- Always use fp32 accumulators for sums and reductions (fp16 leads to large errors).
-- Ensure BLOCK_F covers many elements for good parallel reduction; loop when F >> BLOCK_F.
-- Save mean and rstd per row (or per group) to avoid expensive recomputation in backward.
-- For dgamma/dbeta, prefer two-stage reduction to avoid atomic contention; use atomics only if the workspace and contention are small.
-- Handle boundary masks when loading feature tail elements.
-- Fuse activation (e.g., GELU) in the same kernel to save memory bandwidth and kernel launches.
-- Test numerical correctness vs reference (NumPy/PyTorch) with fp16 inputs and fp32 accumulators.
+## Best practices
 
-This skill provides the core patterns—adapt BLOCK_F, group partitioning, and reduction strategies to your hardware and model shapes for best performance.
+- **FP32 accumulators always** — fp16 sum/sumsq leads to large numerical errors.
+- **Save mean and rstd** per row for backward reuse.
+- **Two-stage reduction** for dgamma/dbeta avoids atomic contention; use `tl.atomic_add` only when contention is low.
+- **Boundary masking:** always mask tail elements when F is not divisible by BLOCK_F.
+- **Fuse activation** (GELU, SiLU) into the same kernel after normalization to save bandwidth.
+- **Fuse into attention epilogue** when possible — see `triton-fused-epilogue-kernels.md`.
+- **Test numerics** vs PyTorch reference: bf16 inputs with fp32 accumulators should give max diff < 1e-3 for standalone normalization.
