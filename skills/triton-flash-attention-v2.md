@@ -5,6 +5,8 @@ description: Teach an AI agent how to implement FlashAttention v2 kernels in Tri
 
 # FlashAttention v2 kernels in Triton
 
+> **Targets:** Triton >= 2.1, SM70+/CDNA2+
+
 Overview
 This guide explains how to implement memory-efficient fused attention (FlashAttention v2) in Triton. The kernel computes O = softmax(QK^T / sqrt(d_k)) V without materializing the N×N attention matrix by iterating over K/V blocks, maintaining running softmax statistics (m, l), and recomputing weights in the backward pass.
 
@@ -13,7 +15,7 @@ Key principles / step-by-step
 2. Data types: accept FP16 inputs; use FP32 accumulators for dot products and softmax math for stability.
 3. Inner loop (per K/V block):
    - Load Q_block (BLOCK_M×d_k), K_block (BLOCK_N×d_k), V_block (BLOCK_N×d_v).
-   - Compute S = tl.dot(Q_block, K_block.T) / sqrt(d_k) (use fp32 accumulators).
+   - Compute S = tl.dot(Q_block, tl.trans(K_block)) * sm_scale (use fp32 accumulators). Note: use `tl.trans()`, not the deprecated `trans_b` kwarg.
    - If causal and this K_block lies after current Q positions, mask upper triangle in S for partial blocks.
    - Apply per-row max: m_block = tl.max(S, axis=1); compute exp(S - m_block).
    - Update running m_prev, l_prev (where l is sum of exp); when m_new > m_prev, rescale accumulator: acc *= tl.exp(m_prev - m_new).
@@ -27,33 +29,27 @@ Backward (recompute-attention):
   - dV contribution: dO accumulates via tl.dot(attn_block.T, dO_block) etc.
 - This avoids storing full attention matrix.
 
-Code examples (conceptual snippets)
+Code examples (pseudocode — adapt offsets/strides for your layout)
 ```python
-@triton.autotune(
-  configs=[{"BLOCK_M": 64, "BLOCK_N": 64}, {"BLOCK_M": 128, "BLOCK_N": 64}],
-  key=["BLOCK_M","BLOCK_N"]
-)
 @triton.jit
 def flash_fwd(Q_ptr, K_ptr, V_ptr, O_ptr, logsumexp_ptr, ...,
               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
-    q = tl.load(Q_ptr + program_id(2)*BLOCK_M*d + tl.arange(0, BLOCK_M)*d)  # simplified
+    # ... load q tile (BLOCK_M, d_k), set up offsets ...
     acc = tl.zeros((BLOCK_M, d_v), dtype=tl.float32)
     m = tl.full((BLOCK_M,), -1e9, dtype=tl.float32)
     l = tl.zeros((BLOCK_M,), dtype=tl.float32)
     for k_start in range(0, N, BLOCK_N):
-        k = tl.load(...)
-        s = tl.dot(q, k, trans_b=True) * (1.0 / sqrt_dk)
+        k = tl.load(...)   # (BLOCK_N, d_k)
+        v = tl.load(...)   # (BLOCK_N, d_v)
+        s = tl.dot(q, tl.trans(k)) * sm_scale  # (BLOCK_M, BLOCK_N)
         # apply triangular mask when causal
-        m_block = tl.max(s, axis=1)
-        exp_s = tl.exp(s - m_block[:, None])
-        # rescale when needed
-        if m_block > m:
-            acc *= tl.exp(m - m_block)
-            l = l * tl.exp(m - m_block)
-            m = m_block
-        acc += tl.dot(exp_s, v_block)
-        l += tl.sum(exp_s, axis=1)
-    tl.store(O_ptr + ..., acc / l[:, None])
+        m_new = tl.maximum(m, tl.max(s, axis=1))      # unconditional update
+        alpha = tl.exp(m - m_new)                      # rescale factor
+        p = tl.exp(s - m_new[:, None])
+        l = l * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        m = m_new
+    tl.store(O_ptr + ..., (acc / l[:, None]).to(OUT_DTYPE))
     tl.store(logsumexp_ptr + ..., m + tl.log(l))
 ```
 

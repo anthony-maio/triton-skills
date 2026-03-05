@@ -5,7 +5,9 @@ description: Build Triton kernel launchers that pick tile sizes, warps, and stag
 
 # Dynamic Tile & Pipeline Launcher for Triton
 
-Overview  
+> **Targets:** Triton >= 2.1, SM70+/CDNA2+; shared memory heuristics tuned for A100/H100
+
+Overview
 For real-time inference you often cannot afford autotune warmup. Write a lightweight launcher that selects BLOCK sizes, num_warps, and num_stages heuristically from input shapes, dtype and device limits. The launcher emits constexpr kernel params so the kernel is optimized without runtime branching.
 
 Key principles / step-by-step

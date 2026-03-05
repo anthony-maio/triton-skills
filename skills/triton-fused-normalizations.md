@@ -5,6 +5,8 @@ description: Teach an AI agent to implement fused LayerNorm, RMSNorm, and GroupN
 
 # Fused Normalization Kernels in Triton (LayerNorm, RMSNorm, GroupNorm)
 
+> **Targets:** Triton >= 2.1, SM70+/CDNA2+
+
 Overview
 This guide teaches how to implement fused forward and backward normalization kernels in Triton: LayerNorm, RMSNorm, and GroupNorm. The focus is single-pass mean/variance accumulation, saving mean and rstd (1/std) for backward, two-stage reductions for weight gradients, and safe concurrent accumulation. Use fp32 accumulators even when inputs are fp16, and map one program per normalization "row" (e.g., per token or per group).
 

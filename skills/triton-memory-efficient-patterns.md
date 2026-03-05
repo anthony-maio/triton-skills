@@ -5,6 +5,8 @@ description: Teach an AI agent to minimize GPU memory via seed-based PRNG, fusio
 
 # Memory-efficient Triton kernels: seed PRNG, fusion, and recomputation
 
+> **Targets:** Triton >= 2.1, SM70+/CDNA2+
+
 Overview
 This guide describes patterns for minimizing GPU memory footprint in Triton kernels: Philox seed-based PRNG (generate dropout masks on-the-fly), activation checkpointing via recomputation, fused elementwise/residual kernels, safe in-place updates, and using tl.extra.libdevice for math functions. These techniques trade a bit of compute for large memory savings and fewer global-memory round-trips.
 

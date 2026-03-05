@@ -5,6 +5,8 @@ description: Teach an AI agent how to implement block-scaled (microscaling) quan
 
 # Quantized & Block-Scaled Matmul Kernels in Triton
 
+> **Targets:** Triton >= 3.0; `tl.dot_scaled` requires SM100+/CDNA4; dequantize fallback works on SM70+/CDNA2+
+
 Overview
 This guide explains how to implement low-precision block-scaled matrix multiplication in Triton for mxfp4/mxfp8/nvfp4 formats. It covers scale tensor layouts (OCP microscaling 5D), hardware-accelerated tl.dot_scaled, dequantize fallbacks, mixed-format support, and unpacking INT4/FP4 weight encodings. Use FP32/FP16 accumulators for numerical stability.
 

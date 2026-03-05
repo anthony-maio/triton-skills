@@ -5,7 +5,9 @@ description: Teach how to fuse epilogue ops into Triton attention/matmul kernels
 
 # Fused Epilogue Kernels in Triton
 
-Overview  
+> **Targets:** Triton >= 2.1, SM70+/CDNA2+
+
+Overview
 Fusing epilogue work (normalization, bias, activation, dropout, gating, residual) directly into attention or GEMM kernels avoids extra HBM writes/reads and kernel launches. Use tl.constexpr flags to emit specialized variants at compile time and perform all final math in-register immediately before the final tl.store.
 
 Key principles / step-by-step
@@ -43,7 +45,10 @@ def gemm_kernel(..., APPLY_BIAS: tl.constexpr, APPLY_LEAKY: tl.constexpr, APPLY_
     if APPLY_LEAKY:
         acc = tl.where(acc > 0, acc, acc * 0.01)
     if APPLY_DROPOUT:
-        acc = acc * tl.load(dropout_mask_ptr + offs)
+        # Prefer seed-based Philox dropout (no mask tensor stored):
+        r = tl.rand(dropout_seed, offs)
+        keep = r > dropout_p
+        acc = acc * keep / (1.0 - dropout_p)
     tl.store(C_ptr + offs, acc.to(C.dtype.element_ty))
 ```
 
@@ -62,5 +67,6 @@ Best practices / pitfalls
 - Keep small weight loads outside heavy K-loops.  
 - Maintain FP32 accumulation to reduce precision loss; cast only at tl.store.  
 - For RMSNorm: var = tl.sum(x*x, axis=1)/dim; rstd = tl.math.rsqrt(var + eps).  
-- Test numerics when combining operations (dropout before/after scaling matters).  
+- Test numerics when combining operations (dropout before/after scaling matters).
+- For dropout in epilogues, prefer seed-based `tl.rand(seed, offs)` over loading a mask tensor — avoids HBM storage and is deterministically reproducible in backward. See `triton-memory-efficient-patterns.md` for details.  
 - Beware of register pressure — complex multi-stream fusions can increase register usage and reduce occupancy; balance fusion vs. kernel resource limits.

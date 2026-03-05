@@ -5,11 +5,13 @@ description: Write optimized Triton GPU kernels for deep learning operations. Co
 
 # Writing Optimized Triton GPU Kernels
 
+> **Targets:** Triton >= 2.1, any GPU with `tl.dot` support (SM70+/CDNA2+)
+
 ## Core Patterns (always apply)
 
 **Kernel structure:** Use `@triton.jit` decorator. Get block ID with `tl.program_id(axis)`. Compute element offsets with `tl.arange(0, BLOCK_SIZE)`. Build `mask = offsets < n_elements` for all loads/stores.
 
-**Block sizes:** Must be powers of two. Declare as `tl.constexpr` parameters. Use `@triton.autotune` to sweep `BLOCK_SIZE_M/N/K` configs per hardware.
+**Block sizes:** Strongly prefer powers of two (required for `tl.arange`; non-power-of-two may work but can reduce performance). Declare as `tl.constexpr` parameters. Use `@triton.autotune` to sweep `BLOCK_SIZE_M/N/K` configs per hardware.
 
 **Memory hierarchy:** Keep intermediates in SRAM via block-level reductions (`tl.sum`, `tl.max`) before writing to global memory. Fuse multiple pointwise ops into one kernel to avoid DRAM round-trips.
 
@@ -23,7 +25,7 @@ description: Write optimized Triton GPU kernels for deep learning operations. Co
 
 ## Quick Reference Examples
 
-Fused row-wise softmax (numerically stable):
+Fused row-wise softmax — verified, based on official Triton tutorial:
 ```python
 @triton.jit
 def fused_softmax(x_ptr, out_ptr, cols, BLOCK: tl.constexpr):
@@ -37,7 +39,7 @@ def fused_softmax(x_ptr, out_ptr, cols, BLOCK: tl.constexpr):
     tl.store(out_ptr + row * cols + offs, out, mask=mask)
 ```
 
-Seed-based dropout (no mask storage):
+Seed-based dropout — verified, based on official Triton tutorial:
 ```python
 @triton.jit
 def dropout(x_ptr, out_ptr, seed, p, n, BLOCK: tl.constexpr):

@@ -5,7 +5,9 @@ description: Teach writing Triton kernels that perform sequential, stateful proc
 
 # Sequential Stateful Processing in a Single Triton Block
 
-Overview  
+> **Targets:** Triton >= 2.1, SM70+/CDNA2+
+
+Overview
 Some workloads require one thread block to process a sequence of items with mutable register state (e.g., an LRU cache router). This pattern uses a grid like (B,) — one block per batch element — and updates registers in a sequential loop so each iteration sees the exact mutated state from previous iterations.
 
 Key principles / step-by-step

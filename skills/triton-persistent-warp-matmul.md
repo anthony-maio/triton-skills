@@ -5,8 +5,10 @@ description: Teach an AI agent to implement persistent, warp-specialized matmul 
 
 # Persistent & Warp-Specialized Matmul Kernels in Triton
 
+> **Targets:** Triton >= 3.0; TMA/warp specialization requires SM90+ (Hopper)
+
 Overview
-This skill teaches how to implement a persistent GEMM in Triton where fewer thread blocks than output tiles are launched and each block iterates over multiple tiles. It covers tile scheduling (linear tile_id → 2D via divmod), persistent loop strides, TMA/device descriptors, producer/consumer warp roles, and epilogue subtiling for memory efficiency.
+This skill teaches how to implement a persistent GEMM in Triton where fewer thread blocks than output tiles are launched and each block iterates over multiple tiles. It covers tile scheduling (linear tile_id → 2D via `//` and `%`), persistent loop strides, TMA/device descriptors, producer/consumer warp roles, and epilogue subtiling for memory efficiency.
 
 Step-by-step / Key principles
 1. Partitioning and constants:
@@ -15,7 +17,7 @@ Step-by-step / Key principles
 2. Persistent scheduling:
    - Launch num_blocks < num_tiles. Each block computes:
      for tile_id in range(start_tile + block_id, num_tiles, num_blocks)
-   - Convert linear tile_id to 2D: m_block, n_block = divmod(tile_id, num_tiles_n) (or use tile_id // num_tiles_n, tile_id % num_tiles_n).
+   - Convert linear tile_id to 2D: m_block = tile_id // num_tiles_n; n_block = tile_id % num_tiles_n. (Note: Python `divmod` is not supported in Triton JIT — always use `//` and `%`.)
 3. Warp specialization:
    - Split warps into producers (async TMA loads or tl.async_copy into shared memory) and consumers (wait on barrier, compute tl.dot).
    - Producers write tiles to sA/sB, then tl.barrier(); consumers perform tl.dot using shared tiles.
@@ -27,7 +29,7 @@ Step-by-step / Key principles
    - Use fp32 accumulators for mixed precision and careful barrier placement between producer/consumer groups.
 
 Practical examples
-- Persistent tile loop + divmod:
+- Persistent tile loop (pseudocode — adapt for your layout):
 ```python
 def cdiv(a,b): return (a + b - 1) // b
 
@@ -39,7 +41,8 @@ start = tl.program_id(0)  # persistent start index
 num_blocks = tl.num_programs(0)
 
 for tile_id in range(start, num_tiles, num_blocks):
-    m_block, n_block = divmod(tile_id, num_tiles_n)
+    m_block = tile_id // num_tiles_n
+    n_block = tile_id % num_tiles_n
     m0 = m_block * BLOCK_M
     n0 = n_block * BLOCK_N
     # load A_tile, B_tile (producers) -> tl.async_copy or TMA

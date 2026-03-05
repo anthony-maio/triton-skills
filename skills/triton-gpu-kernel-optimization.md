@@ -5,7 +5,9 @@ description: Teach an AI agent how to write high-performance Triton GPU kernels 
 
 # Write optimized Triton GPU kernels for deep learning operations
 
-Overview  
+> **Targets:** Triton >= 2.1, SM70+/CDNA2+
+
+Overview
 This guide gives actionable patterns and examples for Triton kernels: block tiling, autotune, grouped/L2-aware tile ordering, fused kernels (softmax/attention), seed-based Philox dropout, mixed precision with FP32 accumulation, SRAM residency for intermediates, and benchmarking with triton.testing.Benchmark. Always use tl.constexpr power-of-two BLOCK sizes and mask OOB accesses.
 
 Key principles / step-by-step
@@ -64,7 +66,7 @@ Benchmark fused add+ReLU vs PyTorch (grid via lambda):
 @triton.jit
 def fused_add_relu(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    offs = pid * tl.arange(0, BLOCK)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     x = tl.load(x_ptr + offs, mask=mask, other=0.0)
     y = tl.load(y_ptr + offs, mask=mask, other=0.0)
@@ -85,7 +87,7 @@ def run_benchmark():
 
 Best practices / common pitfalls
 - Always mask: mask = offs < dim. Missing mask corrupts memory.  
-- BLOCK sizes must be tl.constexpr powers of two (BLOCK_SIZE, BLOCK_SIZE_M/N/K).  
+- BLOCK sizes should be tl.constexpr and strongly prefer powers of two (required for tl.arange; non-power-of-two works in some cases but may reduce performance).  
 - Use tl.dot() + tl.float32 accumulators for FP16 inputs to avoid precision loss.  
 - Recompute PRNG masks (Philox) in backward to avoid storing large boolean masks.  
 - Profile and autotune per-GPU using triton.testing.Benchmark and @triton.autotune.
