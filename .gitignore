@@ -1,0 +1,29 @@
+# Environment
+.env
+.env.*
+
+# Generation scripts and ideas (local-only)
+generate_*.py
+idea*.md
+
+# FastAgent sessions
+.fast-agent/
+fastagent.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Upskill runs
+runs/
