@@ -28,7 +28,7 @@ Copy the `skills/` directory into your project, or install as a Claude Code skil
 
 ```bash
 # From your project root
-git clone https://github.com/YOUR_USERNAME/triton-skills.git .claude/skills/triton-skills
+git clone https://github.com/anthony-maio/triton-skills.git .claude/skills/triton-skills
 ```
 
 Then reference the skill in your Claude Code configuration.
