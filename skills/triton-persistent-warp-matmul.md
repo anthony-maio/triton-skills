@@ -29,35 +29,101 @@ Step-by-step / Key principles
    - Use fp32 accumulators for mixed precision and careful barrier placement between producer/consumer groups.
 
 Practical examples
-- Persistent tile loop (pseudocode — adapt for your layout):
+
+### Persistent matmul with grouped ordering (from KernelAgent/Meta)
+
+Launch only `NUM_SMS` blocks, each looping over tiles with `tl.range(..., flatten=True)` for software pipelining:
+
 ```python
-def cdiv(a,b): return (a + b - 1) // b
+@triton.jit
+def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M: tl.constexpr, NUM_SMS: tl.constexpr):
+    group_id = tile_id // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (tile_id % group_size_m)
+    pid_n = (tile_id % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
 
-num_tiles_m = cdiv(M, BLOCK_M)
-num_tiles_n = cdiv(N, BLOCK_N)
-num_tiles = num_tiles_m * num_tiles_n
+@triton.jit
+def matmul_persistent(a_ptr, b_ptr, c_ptr, M, N, K,
+                      stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                      GROUP_SIZE_M: tl.constexpr, NUM_SMS: tl.constexpr):
+    start_pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    k_tiles = tl.cdiv(K, BLOCK_K)
+    num_tiles = num_pid_m * num_pid_n
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-start = tl.program_id(0)  # persistent start index
-num_blocks = tl.num_programs(0)
+    # Duplicate tile counter for epilogue (workaround for pipelining bug)
+    tile_id_c = start_pid - NUM_SMS
 
-for tile_id in range(start, num_tiles, num_blocks):
-    m_block = tile_id // num_tiles_n
-    n_block = tile_id % num_tiles_n
-    m0 = m_block * BLOCK_M
-    n0 = n_block * BLOCK_N
-    # load A_tile, B_tile (producers) -> tl.async_copy or TMA
-    # tl.barrier()
-    # consumers compute:
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k0 in range(0, K, BLOCK_K):
-        a = load_A_tile(m0, k0)
-        b = load_B_tile(k0, n0)
-        acc += tl.dot(a, b)   # use tl.dot
-    # write C_tile subtile-wise
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        # Compiler hints for aligned accesses
+        offs_m = tl.where(offs_m < M, offs_m, 0)
+        offs_n = tl.where(offs_n < N, offs_n, 0)
+        offs_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
+        offs_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_K + tl.arange(0, BLOCK_K)
+            a = tl.load(a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak,
+                        mask=offs_k[None, :] < K - ki * BLOCK_K, other=0.0)
+            b = tl.load(b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                        mask=offs_k[:, None] < K - ki * BLOCK_K, other=0.0)
+            acc = tl.dot(a, b, acc)
+
+        # Epilogue: recompute pid for output (separate counter avoids pipelining issue)
+        tile_id_c += NUM_SMS
+        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        tl.store(c_ptr + offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn,
+                 acc.to(tl.float16), mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
+```
+
+Launcher — launch exactly `NUM_SMS` blocks:
+```python
+NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+grid = lambda META: (min(NUM_SMS, triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"])),)
+matmul_persistent[grid](a, b, c, M, N, K, ..., NUM_SMS=NUM_SMS)
+```
+
+**Key patterns:**
+- `tl.range(start, end, stride, flatten=True)` enables software pipelining across tile iterations
+- `tl.max_contiguous(tl.multiple_of(offs, BLOCK), BLOCK)` hints the compiler for vectorized loads
+- `tl.where(offs < dim, offs, 0)` replaces masking with clamping for aligned access patterns
+- Separate `tile_id_c` counter for epilogue avoids values crossing prologue/epilogue boundary
+
+### TMA descriptor pattern (SM90+ / Hopper)
+
+Use `TensorDescriptor` for hardware-accelerated memory transfers:
+```python
+from triton.tools.tensor_descriptor import TensorDescriptor
+
+# Launcher — create descriptors with dummy block_shape (autotune fills real values)
+y_dim = B * H * SEQ_LEN
+desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=[1, 1])
+
+# Kernel — load via descriptor (no pointer arithmetic needed)
+@triton.jit
+def _kernel(desc_q, desc_k, desc_v, desc_o, ...):
+    desc_q = tl.make_tensor_descriptor(desc_q, shape=[y_dim, HEAD_DIM],
+                                        strides=[HEAD_DIM, 1], block_shape=[BLOCK_M, HEAD_DIM])
+    q = desc_q.load([offset_y, 0])            # hardware TMA load
+    desc_o.store([offset_y, 0], out.to(dtype)) # hardware TMA store
 ```
 
 Best practices & pitfalls
+- **Persistent vs standard:** Persistent kernels win when kernel launch overhead is significant (many small tiles) or when overlapping loads and compute improves utilization. For large single-tile problems, standard grids may be simpler and equally fast.
+- **`NUM_SMS`:** Always query `torch.cuda.get_device_properties("cuda").multi_processor_count` — don't hardcode.
 - Tune BLOCK_M/BLOCK_N to balance shared memory, registers, and TMA granularity.
-- Ensure correct alignment and block_shape when creating TMA descriptors.
+- Ensure correct alignment and `block_shape` when creating TMA descriptors.
 - Carefully design producer/consumer warp split to avoid idle warps.
-- Profile with Triton Proton and compare against cuBLAS; persistent kernels benefit when kernel launch overhead is significant or when overlapping loads and compute increases utilization.
+- Profile with Triton Proton and compare against cuBLAS.

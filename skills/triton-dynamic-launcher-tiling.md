@@ -133,15 +133,23 @@ if APPLY_RMS:        # tl.constexpr — compiled out when False
     diff = diff * rstd[:, None] * rms_w[None, :]
 ```
 
-## Shared memory budget reference
+## GPU hardware reference (from KernelAgent/Meta specs database)
 
-| GPU | SM Shared Memory | L2 Cache |
-|-----|-----------------|----------|
-| H100 | 228 KB/SM | 50 MB |
-| A100 | 164 KB/SM | 40 MB |
-| T4 | 64 KB/SM | 4 MB |
+| GPU | Arch | Peak FP16 (TFLOPS) | Peak BW (GB/s) | SMs | L1/SM (KB) | L2 (MB) | VRAM |
+|-----|------|--------------------|----------------|-----|------------|---------|------|
+| H100 SXM5 | Hopper | 1979 | 3350 | 132 | 256 | 50 | 80 GB HBM3 |
+| H100 PCIe | Hopper | 1513 | 2000 | 114 | 256 | 50 | 80 GB HBM2e |
+| A100 SXM4 80GB | Ampere | 312 | 2039 | 108 | 192 | 40 | 80 GB HBM2e |
+| A100 SXM4 40GB | Ampere | 312 | 1555 | 108 | 192 | 40 | 40 GB HBM2e |
+| A100 PCIe 80GB | Ampere | 312 | 1935 | 108 | 192 | 40 | 80 GB HBM2e |
+| RTX 4090 | Ada | 82.6 | 1008 | 128 | 128 | 72 | 24 GB GDDR6X |
+| RTX 5080 | Blackwell | 56.3 | 960 | 84 | 128 | 64 | 16 GB GDDR7 |
 
-Estimate: `tile_bytes = (BLOCK_M + BLOCK_N) * HEAD_DIM * dtype_bytes * 2`
+**Shared memory per SM:** H100 = 228 KB configurable, A100 = 164 KB, Ada/Turing = 64-128 KB.
+
+**Tile budget estimate:** `tile_bytes = (BLOCK_M + BLOCK_N) * HEAD_DIM * dtype_bytes * 2`
+
+**Arithmetic intensity threshold:** A kernel is memory-bound when `FLOPs / bytes_transferred < peak_TFLOPS / peak_BW_TB`. For H100 SXM: `1979 / 3.35 ≈ 591 FLOP/byte`. For A100 SXM: `312 / 2.04 ≈ 153 FLOP/byte`.
 
 ## Best practices
 

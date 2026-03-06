@@ -146,6 +146,26 @@ def benchmark(N, provider):
         return triton.testing.do_bench(lambda: torch.relu(x + y))
 ```
 
+## Bottleneck diagnosis with NCU metrics
+
+Before optimizing, profile with `ncu` (NVIDIA Nsight Compute) and classify the kernel into one of three categories:
+
+| Category | Symptom | Key NCU metrics |
+|----------|---------|----------------|
+| **Memory-bound** | DRAM throughput near peak, compute underutilized | `dram__throughput.avg.pct_of_peak_sustained_elapsed` > 60%, tensor core % < 30% |
+| **Compute-bound** | Tensor core / SM utilization high, memory idle | `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed` > 60%, DRAM < 40% |
+| **Underutilized** | Neither saturated (<60% both) — stalls or low occupancy | High `smsp__warp_issue_stalled_*` percentages, `launch__occupancy_limit_*` flags |
+
+**Key NCU metrics to check:**
+
+
+
+**Fix strategies by category:**
+
+- **Memory-bound** → PID swizzle for L2 locality, TMA descriptors (Hopper+), reduce loads via fusion. See `triton-persistent-warp-matmul.md`.
+- **Compute-bound** → Persistent programming (loop over tiles), increase `num_stages`, enable warp specialization.
+- **Underutilized** → Reduce register pressure (smaller BLOCK sizes), increase `num_warps`, sweep autotune configs.
+
 ## Best practices
 
 - **Always mask:** `mask = offs < dim` on every `tl.load`/`tl.store`. Missing masks corrupt memory silently.
@@ -154,4 +174,5 @@ def benchmark(N, provider):
 - **Stride-based addressing:** Pass strides via `.stride()` — never assume contiguous. See `triton-dynamic-launcher-tiling.md` for launcher patterns.
 - **Autotune configs:** Include at least one small config (32x32) for small problem sizes. Use `key=['M', 'N', 'K']` so Triton re-tunes when shapes change.
 - **Recompute over materialize:** Prefer recomputing PRNG masks (Philox `tl.rand`) in backward over storing large boolean masks. See `triton-memory-efficient-patterns.md`.
+- **`tl.max_contiguous` / `tl.multiple_of`:** Hint the compiler for better codegen on aligned accesses: `offs = tl.max_contiguous(tl.multiple_of(offs, BLOCK), BLOCK)`.
 - **Fallback:** Provide a PyTorch reference for CPU/non-Triton environments; check `_HAS_TRITON` and `tensor.is_cuda` before launching.

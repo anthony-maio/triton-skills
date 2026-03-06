@@ -51,6 +51,18 @@ def dropout(x_ptr, out_ptr, seed, p, n, BLOCK: tl.constexpr):
     tl.store(out_ptr + offs, x * keep / (1.0 - p), mask=mask)
 ```
 
+## Performance Bottleneck Quick-Reference
+
+When optimizing an existing kernel, classify the bottleneck first (profile with `ncu`):
+
+| Bottleneck | Diagnosis | Fix |
+|------------|-----------|-----|
+| **Memory-bound** | DRAM throughput > 60% of peak, compute < 30% | PID swizzle, TMA, fuse ops to reduce loads |
+| **Compute-bound** | Tensor core utilization > 60%, DRAM < 40% | Persistent kernels, increase `num_stages`, warp specialization |
+| **Underutilized** | Both < 60%, high stall metrics | Reduce register pressure, increase `num_warps`, autotune |
+
+See `triton-gpu-kernel-optimization.md` for specific NCU metric names and detailed strategies.
+
 ## Specialized Topics
 
 Read these files for detailed guidance when the task involves these areas:
