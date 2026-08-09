@@ -1,3 +1,5 @@
+
+
 # triton-skills
 
 Agent skills for writing optimized [Triton](https://triton-lang.org/) GPU kernels. Built for [Claude Code](https://claude.ai/code), generated with [Upskill](https://github.com/huggingface/upskill) and refined with verified patterns from production kernels.
@@ -27,14 +29,16 @@ Always-loaded fundamentals — `@triton.jit`, block tiling, masking, autotune, g
 
 ## Installation
 
-Copy the `skills/` directory into your project, or install as a Claude Code skill:
+Copy the contents of the `skills/` directory into your `.claude/skills/` folder, or install via:
 
 ```bash
 # From your project root
 git clone https://github.com/anthony-maio/triton-skills.git .claude/skills/triton-skills
+mv .claude/skills/triton-skills/skills/* .claude/skills/triton-skills/
+rm -rf .claude/skills/triton-skills/skills
 ```
 
-Then reference the skill in your Claude Code configuration.
+Claude Code will automatically discover and load the skill.
 
 ## How these were made
 
